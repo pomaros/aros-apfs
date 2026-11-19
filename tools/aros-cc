@@ -1,0 +1,21 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 John Knipper
+set -eu
+: "${AROS_SDK:?Set AROS_SDK to the unpacked public PomAROS AArch64 SDK}"
+: "${AROS_TOOLCHAIN:?Set AROS_TOOLCHAIN to the AROS LLVM installation}"
+dev="$AROS_SDK/AROS/Developer"
+export COMPILER_PATH="$AROS_SDK/tools/darwin-aarch64:$AROS_TOOLCHAIN/bin"
+link=yes
+for arg do
+    case "$arg" in -c|-S|-E|--version|-dumpmachine) link=no;; esac
+done
+if [ "$link" = yes ]; then
+    set -- -nostartfiles -nodefaultlibs "$dev/lib/startup.o" "$@" \
+        -L"$dev/lib" -L"$AROS_TOOLCHAIN/lib/generic" -Wl,--start-group \
+        -lposixc -lstdc -lstdcio -ldos -lexec -laros -lautoinit -llibinit \
+        -lutility -lamiga -larossupport -Wl,--end-group -lclang_rt.builtins-aarch64
+fi
+exec "$AROS_TOOLCHAIN/bin/clang" --target=aarch64-unknown-aros -mcmodel=large \
+    -fno-pic -fno-pie -femulated-tls -isystem "$dev/include/aros/posixc" \
+    -isystem "$dev/include/aros/stdc" -isystem "$dev/include" "$@"

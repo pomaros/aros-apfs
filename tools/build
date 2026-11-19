@@ -1,0 +1,48 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 John Knipper
+set -eu
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+mode=${1:-host}
+case "$mode" in
+    host) CC=${CC:-cc}; set -- ;;
+    aros)
+        : "${AROS_TOOLCHAIN:?Set AROS_TOOLCHAIN}"
+        : "${AROS_SDK:?Set AROS_SDK}"
+        CC="$root/tools/aros-cc"
+        AR="$AROS_TOOLCHAIN/bin/llvm-ar"
+        NM="$AROS_TOOLCHAIN/bin/llvm-nm"
+        RANLIB="$AROS_TOOLCHAIN/bin/llvm-ranlib"
+        export AR NM RANLIB
+        set -- --host=aarch64-unknown-aros ;;
+    *) echo 'usage: tools/build host|aros' >&2; exit 2 ;;
+esac
+export CC
+out="$root/build/$mode"
+mkdir -p "$out"
+cd "$out"
+archive=libfsapfs_20240429.orig.tar.gz
+if [ ! -f "$archive" ]; then
+    curl --fail --location --silent --show-error \
+        "https://deb.debian.org/debian/pool/main/libf/libfsapfs/$archive" -o "$archive.tmp"
+    mv "$archive.tmp" "$archive"
+fi
+echo "665f70705e69ce90c87e0f9c185d47002e242b79b0a37ae52751cdfa8363a538  $archive" | shasum -a 256 -c -
+src="$out/libfsapfs-20240429"
+[ -d "$src" ] || tar -xzf "$archive"
+cd "$src"
+if [ ! -f config.status ]; then
+    PKG_CONFIG=false CFLAGS=-O2 ./configure --build="$(sh config.guess)" "$@" \
+        --enable-static --disable-shared --disable-nls --disable-multi-threading-support \
+        --without-openssl --without-libfuse --disable-dependency-tracking > "$out/configure.log" 2>&1 || {
+        tail -20 "$out/configure.log" >&2; exit 1;
+    }
+fi
+libs='libcerror libcthreads libcdata libclocale libcnotify libcsplit libuna libcfile libcpath libbfio libfcache libfdata libfdatetime libfguid libfmos libhmac libcaes libfsapfs'
+make -s -j"${JOBS:-4}" SUBDIRS="$libs" > "$out/make.log" 2>&1 || { tail -20 "$out/make.log" >&2; exit 1; }
+set -- -Iinclude -Icommon
+for lib in $libs; do set -- "$@" -I"$lib"; done
+if [ "$mode" = aros ]; then set -- "$@" "$root/src/mount.c"; fi
+"$CC" -O2 -std=gnu11 -Wall -Wextra -DHAVE_CONFIG_H "$@" "$root/src/apfs-read.c" \
+    "$root/src/disk.c" libfsapfs/.libs/libfsapfs.a -lz -o "$out/ApfsRead"
+echo "$out/ApfsRead"
