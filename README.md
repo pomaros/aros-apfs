@@ -4,6 +4,15 @@ ApfsRead mounts an unlocked Apple File System volume as a temporary, read-only
 AROS DOS volume. Use `List`, `Copy` and ordinary file reads on `APFSTEST:`.
 A host build can inspect GPT disk images, list directories and extract files.
 
+This project is part of John Knipper's series of native filesystem drivers for AROS.
+[AFS+](https://github.com/jonx/afsplus) is a 64-bit filesystem with Unicode
+filenames and transactions for recovery after a power loss.
+The [exFAT handler](https://github.com/jonx/aros-extfat) reads, writes and
+formats removable media for exchanging files with other operating systems.
+The [APFS reader](https://github.com/pomaros/aros-apfs) mounts unlocked Apple
+File System volumes read-only so you can browse directories and copy files
+from a disk or a raw GPT image.
+
 ## Mount a volume
 
 Start with a raw GPT disk image. The last argument below is its logical sector
