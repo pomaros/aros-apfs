@@ -1,0 +1,262 @@
+--- a/libfsapfs/libfsapfs_btree_node.c	2024-04-29 05:58:42
++++ b/libfsapfs/libfsapfs_btree_node.c	2026-11-20 00:16:55
+@@ -485,6 +485,11 @@
+ 
+ 			switch( btree_node->object_subtype )
+ 			{
++				case 0x0000001fUL: /* fext_tree_key_t and fext_tree_val_t */
++					key_data_size   = 16;
++					value_data_size = 16;
++					break;
++
+ 				case 0x0000000bUL:
+ 					key_data_size   = (uint16_t) sizeof( fsapfs_object_map_btree_key_t );
+ 					value_data_size = (uint16_t) sizeof( fsapfs_object_map_btree_value_t );
+--- a/libfsapfs/libfsapfs_file_system_btree.c	2024-04-29 05:58:42
++++ b/libfsapfs/libfsapfs_file_system_btree.c	2026-11-20 00:16:55
+@@ -34,6 +34,7 @@
+ #include "libfsapfs_encryption_context.h"
+ #include "libfsapfs_file_extent.h"
+ #include "libfsapfs_file_system_btree.h"
++#include "libfsapfs_checksum.h"
+ #include "libfsapfs_inode.h"
+ #include "libfsapfs_io_handle.h"
+ #include "libfsapfs_libbfio.h"
+@@ -277,7 +278,9 @@
+ 
+ 		return( -1 );
+ 	}
+-	if( entry->value_data_size != 8 )
++	if( file_system_btree->sealed_root_oid != 0
++	    ? ( entry->value_data_size != 40 && entry->value_data_size != 56 && entry->value_data_size != 72 )
++	    : entry->value_data_size != 8 )
+ 	{
+ 		libcerror_error_set(
+ 		 error,
+@@ -303,6 +306,12 @@
+ 	 entry->value_data,
+ 	 sub_node_object_identifier );
+ 
++	if( sub_node_object_identifier > UINT64_MAX - file_system_btree->sealed_root_oid )
++	{
++		return( -1 );
++	}
++	sub_node_object_identifier += file_system_btree->sealed_root_oid;
++
+ #if defined( HAVE_DEBUG_OUTPUT )
+ 	if( libcnotify_verbose != 0 )
+ 	{
+@@ -548,6 +557,13 @@
+ 
+ 			goto on_error;
+ 		}
++		/* Headerless sealed catalog nodes retain the 32-byte header space. */
++		if( file_system_btree->sealed_root_oid && node->object_type == 0
++		 && node->object_subtype == 0 && ( node->node_header->flags & 0x18 ) == 0x18 )
++		{
++			node->object_type = 2;
++			node->object_subtype = 0x0e;
++		}
+ 		if( node->object_type == 0x00000000UL )
+ 		{
+ 			if( libfsapfs_btree_node_free(
+@@ -888,6 +904,13 @@
+ 
+ 			goto on_error;
+ 		}
++		/* Headerless sealed catalog nodes retain the 32-byte header space. */
++		if( file_system_btree->sealed_root_oid && node->object_type == 0
++		 && node->object_subtype == 0 && ( node->node_header->flags & 0x18 ) == 0x18 )
++		{
++			node->object_type = 3;
++			node->object_subtype = 0x0e;
++		}
+ 		if( ( node->object_type != 0x00000003UL )
+ 		 && ( node->object_type != 0x10000003UL ) )
+ 		{
+@@ -5008,6 +5031,116 @@
+ 	return( -1 );
+ }
+ 
++/* Read only the physical FEXT subtrees whose key ranges can contain private_id.
++ * Every recursive call must descend one level. The caller owns the result array,
++ * including any extents already appended if a later node fails validation. */
++static int sealed_extent_node(
++     libfsapfs_file_system_btree_t *tree, libbfio_handle_t *io,
++     uint64_t block, int expected_level, uint64_t private_id,
++     libcdata_array_t *extents, uint64_t *last_end, libcerror_error_t **error )
++{
++	libfsapfs_btree_node_t *node = NULL;
++	libfsapfs_file_extent_t *extent = NULL;
++	const uint32_t block_size = tree->io_handle->block_size;
++	const uint64_t blocks = tree->io_handle->container_size / block_size;
++	uint64_t checksum, stored, oid, previous_id = 0, previous_offset = 0;
++	uint8_t *data = NULL;
++	int count, result = -1;
++
++	if( !block || block >= blocks || block > INT64_MAX / block_size )
++		goto done;
++	data = memory_allocate( block_size );
++	if( !data || libbfio_handle_read_buffer_at_offset( io, data, block_size,
++	     (off64_t)( block * block_size ), error ) != (ssize_t) block_size )
++		goto done;
++	byte_stream_copy_to_uint64_little_endian( data, stored );
++	byte_stream_copy_to_uint64_little_endian( data + 8, oid );
++	if( oid != block || libfsapfs_checksum_calculate_fletcher64(
++	     &checksum, data + 8, block_size - 8, 0, error ) != 1 || checksum != stored )
++		goto done;
++	if( libfsapfs_btree_node_initialize( &node, error ) != 1 ||
++	    libfsapfs_btree_node_read_data( node, data, block_size, error ) != 1 )
++		goto done;
++	int root = expected_level < 0;
++	int level = node->node_header->level;
++	if( node->object_type != ( root ? 0x40000002UL : 0x40000003UL ) ||
++	    node->object_subtype != 0x1f || level > 16 || ( !root && level != expected_level ) ||
++	    node->node_header->flags != ( 4 | ( root ? 1 : 0 ) | ( level ? 0 : 2 ) ) ||
++	    libfsapfs_btree_node_get_number_of_entries( node, &count, error ) != 1 )
++		goto done;
++
++	uint64_t pending_child = 0;
++	for( int index = 0; index < count; index++ )
++	{
++		libfsapfs_btree_entry_t *entry = NULL;
++		uint64_t id, offset, value;
++		if( libfsapfs_btree_node_get_entry_by_index( node, index, &entry, error ) != 1 ||
++		    !entry || entry->key_data_size != 16 || entry->value_data_size != (level ? 8 : 16) )
++			goto done;
++		byte_stream_copy_to_uint64_little_endian( entry->key_data, id );
++		byte_stream_copy_to_uint64_little_endian( entry->key_data + 8, offset );
++		byte_stream_copy_to_uint64_little_endian( entry->value_data, value );
++		if( index && ( id < previous_id || ( id == previous_id && offset <= previous_offset ) ) )
++			goto done;
++		previous_id = id;
++		previous_offset = offset;
++		if( level )
++		{
++			/* Each separator is the minimum key in the corresponding child. */
++			if( pending_child && ( id > private_id || (id == private_id && offset) ) &&
++			    sealed_extent_node( tree, io, pending_child, level - 1,
++			     private_id, extents, last_end, error ) != 1 )
++				goto done;
++			pending_child = 0;
++			if( id > private_id ) break;
++			if( !value ) goto done;
++			pending_child = value;
++		}
++		else if( id == private_id )
++		{
++			uint64_t physical;
++			int array_index;
++			byte_stream_copy_to_uint64_little_endian( entry->value_data + 8, physical );
++			if( !value || value >> 56 || value % block_size || offset % block_size ||
++			    offset < *last_end || value > INT64_MAX || offset > INT64_MAX - value ||
++			    physical >= blocks || value / block_size > blocks - physical )
++				goto done;
++			if( libfsapfs_file_extent_initialize( &extent, error ) != 1 ) goto done;
++			extent->logical_offset = offset;
++			extent->physical_block_number = physical;
++			extent->data_size = value;
++			if( libcdata_array_append_entry( extents, &array_index, (intptr_t *) extent, error ) != 1 )
++				goto done;
++			extent = NULL;
++			*last_end = offset + value;
++		}
++	}
++	if( pending_child && sealed_extent_node( tree, io, pending_child, level - 1,
++	    private_id, extents, last_end, error ) != 1 )
++		goto done;
++	result = 1;
++done:
++	if( extent ) libfsapfs_file_extent_free( &extent, NULL );
++	if( node ) libfsapfs_btree_node_free( &node, NULL );
++	if( data ) memory_free( data );
++	return result;
++}
++
++static int sealed_get_extents(
++     libfsapfs_file_system_btree_t *tree, libbfio_handle_t *io, uint64_t private_id,
++     libcdata_array_t *extents, libcerror_error_t **error )
++{
++	uint64_t last_end = 0;
++	if( sealed_extent_node( tree, io, tree->fext_root, -1, private_id, extents,
++	     &last_end, error ) != 1 )
++	{
++		libcerror_error_set( error, LIBCERROR_ERROR_DOMAIN_IO, LIBCERROR_IO_ERROR_READ_FAILED,
++		 "Unable to traverse sealed volume file extent tree." );
++		return -1;
++	}
++	return last_end ? 1 : 0;
++}
++
+ /* Retrieves file extents for a specific identifier from the file system B-tree
+  * Returns 1 if successful, 0 if not found or -1 on error
+  */
+@@ -5034,6 +5167,10 @@
+ 		 function );
+ 
+ 		return( -1 );
++	}
++	if( file_system_btree->sealed_root_oid )
++	{
++		return( sealed_get_extents( file_system_btree, file_io_handle, identifier, file_extents, error ) );
+ 	}
+ #if defined( HAVE_DEBUG_OUTPUT )
+ 	if( libcnotify_verbose != 0 )
+--- a/libfsapfs/libfsapfs_file_system_btree.h	2024-04-29 05:58:42
++++ b/libfsapfs/libfsapfs_file_system_btree.h	2026-11-20 00:16:55
+@@ -73,6 +73,10 @@
+ 	 */
+ 	uint64_t root_node_block_number;
+ 
++	/* Nonzero for a sealed catalog with root-relative child identifiers. */
++	uint64_t sealed_root_oid;
++	uint64_t fext_root;
++
+ 	/* Flag to indicate case folding should be used
+ 	 */
+ 	uint8_t use_case_folding;
+--- a/libfsapfs/libfsapfs_volume.c	2024-04-29 05:58:42
++++ b/libfsapfs/libfsapfs_volume.c	2026-11-20 00:16:55
+@@ -2911,6 +2911,11 @@
+ 
+ 		goto on_error;
+ 	}
++	if( ( internal_volume->superblock->incompatible_features_flags & 0x20 ) != 0 )
++	{
++		file_system_btree->sealed_root_oid = internal_volume->superblock->file_system_root_object_identifier;
++		file_system_btree->fext_root = internal_volume->superblock->fext_root;
++	}
+ 	if( libfsapfs_file_system_initialize(
+ 	     &( internal_volume->file_system ),
+ 	     internal_volume->io_handle,
+--- a/libfsapfs/libfsapfs_volume_superblock.c	2024-04-29 05:58:42
++++ b/libfsapfs/libfsapfs_volume_superblock.c	2026-11-20 00:16:55
+@@ -271,6 +271,16 @@
+ 
+ 		return( -1 );
+ 	}
++	/* apfs_fext_tree_oid and apfs_fext_tree_type follow integrity_meta_oid. */
++	if( data_size >= 1044 )
++	{
++		uint32_t tree_type = 0;
++		byte_stream_copy_to_uint32_little_endian( data + 1040, tree_type );
++		if( tree_type == 0x40000002UL )
++		{
++			byte_stream_copy_to_uint64_little_endian( data + 1032, volume_superblock->fext_root );
++		}
++	}
+ 	if( is_snapshot == 0 )
+ 	{
+ 		expected_object_type = 0x0000000dUL;
+--- a/libfsapfs/libfsapfs_volume_superblock.h	2024-04-29 05:58:43
++++ b/libfsapfs/libfsapfs_volume_superblock.h	2026-11-20 00:16:55
+@@ -80,6 +80,9 @@
+ 	 */
+ 	uint64_t volume_flags;
+ 
++	/* Physical file extent tree of a sealed volume. */
++	uint64_t fext_root;
++
+ 	/* The volume name
+ 	 */
+ 	uint8_t volume_name[ 256 ];

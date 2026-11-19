@@ -60,7 +60,11 @@ build/host/ApfsRead --image example.img 512 1 0 /Documents/example.txt copy.txt
 
 On macOS, `python3 tests/image.py` creates a disposable APFS volume, compares
 the volume UUID with Disk Utility, extracts a known file and verifies that
-the image digest is unchanged.
+the image digest is unchanged. Run `python3 tests/sealed.py` for a second fixture
+created with Apple's `apfs_prepare_cryptex` tool. It checks 256 directory
+entries and compares extracted file contents with the original bytes.
+To generate a sealed GPT image for another reader, run
+`python3 tests/sealed.py --make-image fixture.dmg`.
 
 For an AArch64 AROS build on Apple Silicon macOS, set these two paths to the
 unpacked public SDK and the AROS LLVM installation. The executable is
@@ -79,7 +83,14 @@ inside a valid primary GPT. Disk unlock, snapshot selection, symbolic link
 traversal and macOS System/Data firmlink resolution are outside the current
 mount implementation. The DOS mount uses classic file-info and seek packets.
 Reading an encrypted internal Mac Data volume requires separate support for
-authorized hardware decryption. Physical M1 volume access awaits testing.
+authorized hardware decryption.
+
+The build patches libfsapfs to read headerless, hashed catalog nodes and the
+physical file extent tree on sealed volumes. On an M1 running native AROS,
+`List` enumerated the root of the internal Macintosh HD and `Copy` read
+`System/Library/CoreServices/SystemVersion.plist` into RAM. The reader accesses
+the current catalog. It does not authenticate Apple's signed seal or select a
+boot snapshot.
 
 ## Acknowledgments and references
 
@@ -101,12 +112,16 @@ their work available for comparison:
 - [linux-apfs/linux-apfs-rw](https://github.com/linux-apfs/linux-apfs-rw), an APFS filesystem module for Linux.
 - [avighnac/libapfs](https://github.com/avighnac/libapfs), a C++ APFS reader.
 
+Joe T. Sylve describes the catalog and file extent trees used by the reader in
+[APFS Internals: Sealed Volumes](https://jtsylve.blog/post/2022/12/20/APFS-Sealed-Volumes).
+
 Apple documents the on-disk structures and the relationship between containers
 and volumes in the [Apple File System Reference](https://developer.apple.com/support/downloads/Apple-File-System-Reference.pdf).
 
 ## License
 
-John Knipper's code in this repository is distributed under the [MIT License](LICENSE).
+ApfsRead and its build and test tools use the [MIT License](LICENSE).
+The downstream patch to libfsapfs uses the library's LGPL-3.0-or-later license.
 The build links libfsapfs under LGPL-3.0-or-later. Its bundled dependencies
 and zlib retain their respective licenses. The pinned source archive includes
 the upstream copyright notices and license texts. [Upstream license information](https://github.com/libyal/libfsapfs#readme)

@@ -28,8 +28,16 @@ if [ ! -f "$archive" ]; then
     mv "$archive.tmp" "$archive"
 fi
 echo "665f70705e69ce90c87e0f9c185d47002e242b79b0a37ae52751cdfa8363a538  $archive" | shasum -a 256 -c -
-src="$out/libfsapfs-20240429"
-[ -d "$src" ] || tar -xzf "$archive"
+patchfile="$root/patches/libfsapfs-sealed.patch"
+revision=$(shasum -a 256 "$patchfile" | cut -c1-16)
+src="$out/libfsapfs-20240429-$revision"
+if [ ! -d "$src" ]; then
+    staging=$(mktemp -d "$out/unpack.XXXXXX")
+    trap 'rm -rf "$staging"' EXIT
+    tar -xzf "$archive" -C "$staging"
+    (cd "$staging/libfsapfs-20240429" && patch -s -p1 < "$patchfile")
+    mv "$staging/libfsapfs-20240429" "$src"
+fi
 cd "$src"
 if [ ! -f config.status ]; then
     PKG_CONFIG=false CFLAGS=-O2 ./configure --build="$(sh config.guess)" "$@" \
